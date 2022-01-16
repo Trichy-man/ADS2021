@@ -23,6 +23,7 @@ library(lsa)
 library(ggraph)
 library(tidyverse)
 library(tidygraph)
+library(ggrepel)
 library(corrplot)
 library(rgexf)
 library(dplyr)
@@ -360,7 +361,7 @@ ggplot(data, aes(fill=condition, y=value, x=specie)) +
 As a fun fact, Tera is described as "devilish" by the zoo keepers. We can wonder if
 this is related to the number of Tera's exes... 
 
-```{r, include = T,warning = F, message = F}
+```{r fig.width= 10, message=FALSE, warning=FALSE, include=T}
 ended_relationships_from =
   exes_edges %>%
   group_by(from) %>%
@@ -383,7 +384,7 @@ ended_relationships <-
 
 ggplot(ended_relationships, aes(name, n)) +
   geom_col(aes(fill=factor(gender)), show.legend=FALSE) +
-  theme_classic()
+  theme(axis.text.x = element_text(angle = 90))
 ```
 
 ## Couples and Exes
@@ -443,16 +444,18 @@ family_graph <- tbl_graph(edges = family_edges, nodes = nodes, directed = F)
 
 family_directed_graph <- graph_from_adjacency_matrix(family_directed_edges)
 
-families = components(family_graph, mode='weak')
+families = components(family_directed_graph, mode='weak')
 
-family_graph %>%
-ggraph(layout = layout_nicely(family_graph)) +
+family_directed_graph %>%
+ggraph(layout = layout_nicely(family_directed_graph)) +
   geom_edge_arc(arrow = arrow(length = unit(2, 'mm')),
                  end_cap = circle(2, 'mm'),
                 strength = 0.1 ) +
   geom_node_point(aes(size = 1, color=factor(membership(families)[name])),
                   show.legend = F) +
   geom_node_text(aes(label = name), repel = T)
+
+families = components(family_graph)
 
 ```
 
@@ -535,7 +538,7 @@ ggplot(aes(x=power, y=pagerank)) +
   geom_text(aes(label=name)) +
   geom_hline(aes(yintercept = mc)) + 
   geom_vline(aes(xintercept = mp)) +
-  theme_bw()
+  theme_classic()
 ```
 
 ## Centrality and Power
@@ -596,8 +599,7 @@ As a second observation, we could take in consideration the found communities fo
 ## Communities
 ```{r, include = T,warning = F, message = F}
 communities = cluster_optimal(family_couples_graph)
-length(communities)
-modularity(communities)
+
 ### Communities detected 
 family_couples_graph %>% 
   activate(nodes) %>%
@@ -631,7 +633,7 @@ family_couples_exes_graph %>%
   mutate(pagerank = centrality_pagerank()) %>%
   activate(edges) %>%
   mutate(betweenness = centrality_edge_betweenness()) %>%
-  ggraph(layout = family_couples_exes_coords) +
+  ggraph(layout = fce_coords) +
   geom_edge_arc(aes(alpha = betweenness), strength = 0.05) +
   geom_node_point(aes(size = pagerank, colour = pagerank)) +
   geom_node_text(aes(label = name), repel = T)  +
@@ -647,7 +649,7 @@ b
 
 ## Percolation
 
-In this particular case we could use percolation as a vaccination strategy for the penguins. Here we consider
+In this particular case we could use percolation as a vaccination strategy for the penguins. Here we consider to remove 80% of the nodes.
 ```{r, include = T,warning = F, message = F}
 # resilience
 size = vcount(family_couples_exes_graph) -
