@@ -1,0 +1,681 @@
+---
+title: "Penguins of Kyoto"
+author: "Renato Acampora"
+#date: "4/1/2022"
+output: 
+  ioslides_presentation:
+    widescreen: true
+    smaller: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = F,warning = F, message = F}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, include = T,warning = F, message = F}
+setwd("E:/RenatoUni/OneDrive - Università degli Studi di Udine/4th anno/Advanced_Data_Science")
+
+library(knitr)
+library(igraph)
+library(lsa)
+library(ggraph)
+library(tidyverse)
+library(tidygraph)
+library(corrplot)
+library(rgexf)
+library(dplyr)
+
+
+#For power 
+library(lpSolve)
+library(lpSolveAPI)
+
+regularify = function (g) {
+  n = vcount(g)
+  m = ecount(g)
+  E = get.edges(g, E(g))
+  B = matrix(0, nrow = n, ncol = m)
+  # build incidence matrix
+  for (i in 1:m) {
+    B[E[i,1], i] = 1
+    B[E[i,2], i] = 1
+  }  
+  # objective function
+  obj = rep(0, m + 1)
+  # constraint matrix
+  con = cbind(B, rep(-1, n))
+  # direction of constraints
+  dir = rep("=", n)
+  # right hand side terms
+  rhs = -degree(g)
+  # solve the LP problem
+  sol = lp("max", obj, con, dir, rhs)
+  # get solution
+  if (sol$status == 0) {
+    s = sol$solution
+    # weights
+    w = s[1:m] + 1
+    # weighted degree
+    d = s[m+1]
+  }
+  # return the solution
+  if (sol$status == 0) {
+    return(list(weights = w, degree = d)) 
+  }
+  else {
+    return(NULL)   
+  }
+}
+
+# Compute power x = (1/x) A 
+#INPUT
+# A = graph adjacency matrix
+# t = precision
+# OUTPUT
+# A list with:
+# vector = power vector
+# iter = number of iterations
+
+power = function(A, t) {
+  n = dim(A)[1];
+  # x_2k
+  x0 = rep(0, n);
+  # x_2k+1
+  x1 = rep(1, n);
+  # x_2k+2
+  x2 = rep(1, n);
+  diff = 1
+  eps = 1/10^t;
+  iter = 0;
+  while (diff > eps) {
+    x0 = x1;
+    x1 = x2;
+    x2 = (1/x2) %*% A;
+    diff = sum(abs(x2 - x0));
+    iter = iter + 1;
+  } 
+  # it holds now: alpha x2 = (1/x2) A
+  alpha = ((1/x2) %*% A[,1]) / x2[1];
+  # hence sqrt(alpha) * x2 = (1/(sqrt(alpha) * x2)) A
+  x2 = sqrt(alpha) %*% x2;
+  return(list(vector = as.vector(x2), iter = iter))
+}
+
+# percolation removes nodes from a graph and computes 
+# the size of the giant connected component
+# INPUT
+# g: graph to percolate
+# size: number of nodes to remove 
+# d: removal vector
+# OUTPUT
+# giant: a vector with sizes of giant components when nodes are removed
+percolate = function(g, size, d) {
+  
+  giant = vector()
+  
+  # initial size of giant component
+  c = components(g)
+  giant[1] = max(c$csize)
+  
+  # find vital nodes
+  names(d) = 1:length(d)
+  d = sort(d, decreasing=TRUE)
+  vital = as.integer(names(d[1:size]))
+  
+  # compoute size of giant component after incremental removal 
+  for (i in 1:size) {
+    c = components(delete_vertices(g, vital[1:i]))
+    giant[i+1] = max(c$csize)
+  }
+  
+  return(giant)
+  
+}
+
+```
+
+```{r, include = T,warning = F, message = F}
+
+#### Reading the gexf files
+
+complicated <- read.gexf("./Penguin_Complicated.gexf") #consider to discard since it is pretty much an empty relation
+friends <- read.gexf("./Penguin_Friends.gexf") #consider to discard since it is pretty much an empty relation
+couples <- read.gexf("./Penguin_Couples.gexf")
+enemies <- read.gexf("./Penguin_Enemies.gexf")#consider to discard since it is pretty much an empty relation
+exes <- read.gexf("./Penguin_Exes.gexf")
+family <- read.gexf("./Penguin_Family.gexf")
+
+### From gexf to igraph (using rgexf library)
+complicated_graph <- gexf.to.igraph(complicated)
+complicated_coords = layout_nicely(complicated_graph)
+#plot(complicated_graph, layout = complicated_coords)
+
+friends_graph <- gexf.to.igraph(friends)
+friends_coords = layout_nicely(friends_graph)
+#plot(friends_graph, layout = friends_coords)
+
+couples_graph <- gexf.to.igraph(couples)
+couples_coords = layout_nicely(couples_graph)
+#plot(couples_graph, layout = couples_coords)
+
+enemies_graph <- gexf.to.igraph(enemies)
+enemies_coords = layout_nicely(enemies_graph)  
+#plot(enemies_graph, layout = enemies_coords)
+
+exes_graph <- gexf.to.igraph(exes)
+exes_coords = layout_nicely(exes_graph)
+#plot(exes_graph, layout = exes_coords)
+
+family_graph <- gexf.to.igraph(family)
+family_coords = layout_nicely(family_graph)
+#plot(family_graph, layout = family_coords)
+
+```
+
+```{r, include = T,warning = F, message = F}
+###NODES
+nodes = as_tibble(V(complicated_graph)$name)
+
+nodes <-
+  nodes %>%
+  rename(name = value) %>% 
+  mutate(id = 1:nrow(nodes)) %>%
+  select(id, name)
+
+###EDGES
+###We make sure every edge is unique (undirected graph) and populate the column
+###with the relation type (complicated, friends, couple, exes, family, enemies)
+complicated_edges = as_edgelist(complicated_graph)
+complicated_edges =
+  as_tibble(complicated_edges) %>%
+  mutate(from = V1, to = V2) %>%
+  mutate(complicated = 1) %>%
+  distinct() %>%
+  select(-V1, -V2, from, to, complicated)
+
+family_edges = as_edgelist(family_graph)
+family_edges = 
+  as_tibble(family_edges)  %>%
+  mutate(from = V1, to = V2) %>%
+  mutate(family = 1) %>%
+  distinct() %>%
+  select(-V1, -V2, from, to, family)
+
+family_directed_edges =
+  read.table("./mhfeng-penguins_of_kyoto-ba1e9dce73ab/csv/Penguins of Kyoto - Family.csv",
+             sep = ",", row.names = 1, header = TRUE, stringsAsFactors = FALSE)
+
+family_directed_edges = as.matrix(family_directed_edges)
+
+couples_edges = as_edgelist(couples_graph)
+couples_edges = 
+  as_tibble(couples_edges)  %>%
+  mutate(from = V1, to = V2) %>%
+  mutate(couple = 1) %>%
+  distinct() %>%
+  select(-V1, -V2, from, to, couple)
+
+enemies_edges = as_edgelist(enemies_graph)
+enemies_edges = 
+  as_tibble(enemies_edges)  %>%
+  mutate(from = V1, to = V2) %>%
+  mutate(enemies = 1) %>%
+  distinct() %>%
+  select(-V1, -V2, from, to, enemies)
+
+exes_edges = as_edgelist(exes_graph)
+exes_edges = 
+  as_tibble(exes_edges)  %>%
+  mutate(from = V1, to = V2) %>%
+  mutate(exes = 1) %>%
+  distinct() %>%
+  select(-V1, -V2, from, to, exes)
+
+friends_edges = as_edgelist(friends_graph)
+friends_edges = 
+  as_tibble(friends_edges)  %>%
+  mutate(from = V1, to = V2) %>%
+  mutate(friends = 1) %>%
+  distinct() %>%
+  select(-V1, -V2, from, to, friends)
+
+family_couples_edges = 
+  full_join(family_edges, couples_edges) %>%
+  replace_na(list(couple = 0, family = 0))
+
+family_exes_edges = 
+  full_join(family_edges, exes_edges) %>%
+  replace_na(list(exes = 0, family = 0))
+
+family_couples_exes_edges =
+  full_join(family_couples_edges, family_exes_edges)
+  
+couples_exes_edges = 
+  full_join(couples_edges, exes_edges) %>%
+  replace_na(list(couple = 0, exes = 0)) %>%
+  mutate(relation = ifelse(couple == 1, "couple","exes")) %>%
+  select(-couple, -exes)
+
+####The graph of all relationships
+# TODO consider to have a vector of strings defining the relationships in the edges tibble
+edges = full_join(complicated_edges, couples_edges)
+edges = full_join(edges, enemies_edges)
+edges = full_join(edges, exes_edges)
+edges = full_join(edges, family_edges)
+edges = full_join(edges, friends_edges)
+
+edges = 
+  edges %>%
+  replace_na(list(complicated = 0, couple = 0, 
+                  enemies = 0, exes = 0, family = 0,
+                  friends = 0)) %>%
+  distinct()
+
+#converting names to ids in order to build the graph
+edges <-
+  edges %>%
+  mutate(from = nodes %>%
+                rename(from = name) %>%
+                right_join(edges, by=c("from")) %>%
+                select(id)) %>%
+  mutate(to = nodes %>%
+                rename(to = name) %>%
+                right_join(edges, by=c("to")) %>%
+                select(id))
+```
+
+
+## Kyoto's Penguins
+In 2020 the Kyoto Aquarium collected social relationship data among the 59 penguins of the Zoo. The scientific community then designed a dataset in order to study such relationship in a more formal manner. The result is a collection of social relationships, names, genders, and trivia about the penguins.
+
+An Example:
+
+**Rokkaku** is a Male: Amazingly attached to his home.
+
+**Koko** is a Female: She is a little bit devilish.
+
+**Rokkaku** and **Koko** are a Couple.
+
+## Objective
+Investigate the relationships between the penguins. In particular, both the current and the past mating relationships and how they relate to the families in the colony.
+
+
+## Gender Distribution
+
+There are 23 female and 36 male exemplars:
+```{r, include = T,warning = F, message = F}
+### Reading the Penguins Metadata
+metadata <- 
+  read.table("./mhfeng-penguins_of_kyoto-ba1e9dce73ab/csv/Penguins of Kyoto - Metadata.csv",
+             header = TRUE, sep = ",", stringsAsFactors = FALSE)
+metadata <- 
+  metadata %>%
+  arrange(Name) %>%
+  mutate(id = row_number()) %>%
+  rename(name = Name, gender = Gender, info = Info) %>%
+  select(id, everything())
+
+### Grouping by gender
+gender <-
+  metadata %>%
+  group_by(gender) %>%
+  count()
+
+ggplot(gender, aes(gender, n)) +
+  geom_col(aes(fill=factor(gender)), show.legend=FALSE) +
+  theme_classic()
+```
+
+## Who decides to be engaged?
+Due to the lower number of female penguins, males have to compete for a partner.
+
+```{r include = T, message=F, warning=F}
+couple_gender <- 
+  inner_join(rename(metadata, from=name), couples_edges, by='from')%>%
+  rename(gender_from=gender) %>%
+  select(from, gender_from, to)
+  
+couple_gender <-
+  inner_join(couple_gender, rename(metadata, to=name), by='to') %>%
+  rename(gender_to=gender) %>%
+  select(from, gender_from, to, gender_to) %>%
+  group_by(gender_from,gender_to) %>%
+  count()
+
+specie <- c(rep("F", 2), rep("M", 2))
+condition <- c(rep(c("in a couple", "not in a couple"), 2))
+value <- c(21, 2, 21, 15)
+data <- data.frame(specie, condition, value)
+
+ggplot(data, aes(fill=condition, y=value, x=specie)) + 
+    geom_bar(position="fill", stat="identity") +
+    scale_fill_viridis(discrete = T) +
+    xlab("")
+```
+
+## Investigating past relationships
+
+As a fun fact, Tera is described as "devilish" by the zoo keepers. We can wonder if
+this is related to the number of Tera's exes... 
+
+```{r, include = T,warning = F, message = F}
+ended_relationships_from =
+  exes_edges %>%
+  group_by(from) %>%
+  count() %>%
+  rename(name = from, n_from = n)
+
+ended_relationships_to =
+  exes_edges %>%
+  group_by(to) %>%
+  count() %>%
+  rename(name = to, n_to = n)
+
+ended_relationships <-
+  full_join(ended_relationships_from, ended_relationships_to) %>%
+  replace_na(list(n_from = 0, n_to = 0)) %>%
+  transmute(n = n_from + n_to) %>%
+  arrange(desc(n)) %>%
+  inner_join(metadata) %>%
+  select(name, gender, n)
+
+ggplot(ended_relationships, aes(name, n)) +
+  geom_col(aes(fill=factor(gender)), show.legend=FALSE) +
+  theme_classic()
+```
+
+## Couples and Exes
+We remark that the "exes" relationship spans over a year.
+```{r, include = T,warning = F, message = F}
+### Couples exes graph
+
+couples_exes_nodes =
+  couples_edges %>%
+  select(from, to) %>%
+  full_join(select(exes_edges, from, to))
+
+from = pull(couples_exes_nodes, from)
+to = pull(couples_exes_nodes, to)
+
+couples_exes_nodes = 
+  tibble(name = append(from, to)) %>%
+  distinct() %>%
+  inner_join(select(metadata, name, gender)) %>%
+  arrange(name)
+
+couples_exes_graph <- tbl_graph(nodes = couples_exes_nodes, 
+                                edges = couples_exes_edges, 
+                                directed = FALSE,
+                                node_key = "name")
+
+couples_exes_coords = layout_nicely(couples_exes_graph)
+
+set_graph_style()
+couples_exes_graph %>%
+  activate(nodes) %>%
+  mutate(hub = centrality_hub()) %>%
+ggraph(layout = couples_exes_coords) +
+  geom_edge_arc(aes(linetype = factor(relation)), strength = 0.2) +
+  geom_node_point(aes(size = hub, color= factor(gender))) +
+  geom_node_text(aes(label = name), repel = T)
+```
+
+## Couples and Exes
+
+**Tera**, as seen previously, had 6 past relationships in the last year. She ended up with **Osshii** as a partner which is described as a "Control Freak".
+
+A second interesting event is the relationship happened between father and son **Kuruma** and **Nijou**. **Kuruma** is described as "the type that wants to eat alone and likes both males and females", unluckily no trivia was given for **Nijou**.
+
+A second homosexual relationship happened between **Kami**, "timid lover", and **Higashi** "rock collector". It is interesting to notice the absence of female homosexual relationships.
+
+Moreover, the structure of the connected component could be an important factor in the context of different diseases. For example, for a sexually transmissible disease like chlamydia. 
+
+https://www.nbcnews.com/id/wbna7753742 [^1]
+
+## Families
+
+We now focus on the families of the colony. The relation is directed and
+must be interpreted as follows: x is child of y. We see that there are 18 families, of which 7 are 1 member families.
+```{r, include = T,warning = F, message = F}
+family_graph <- tbl_graph(edges = family_edges, nodes = nodes, directed = F)
+
+family_directed_graph <- graph_from_adjacency_matrix(family_directed_edges)
+
+families = components(family_graph, mode='weak')
+
+family_graph %>%
+ggraph(layout = layout_nicely(family_graph)) +
+  geom_edge_arc(arrow = arrow(length = unit(2, 'mm')),
+                 end_cap = circle(2, 'mm'),
+                strength = 0.1 ) +
+  geom_node_point(aes(size = 1, color=factor(membership(families)[name])),
+                  show.legend = F) +
+  geom_node_text(aes(label = name), repel = T)
+
+```
+
+## Couples-Families Network
+
+As one would expect, penguin couples connect different families. This is showed in the following 
+Figure, were the size of nodes is given by their Pagerank score. 
+
+We want to investigate the meaning of such measure in the Couple-Family network. Moreover, we will measure power in the same network and compare it with centrality. 
+
+We interpreted the information given by both measures (which are actually highly correlated) as following: "Penguins that are more prolific are more important/powerful". In particular, this interpretation fits the fight that happens in nature for reproduction. 
+
+## Centrality in the Couples-Families Network
+
+```{r, include = T,warning = F, message = F}
+family_couples_graph <- 
+  tbl_graph(edges = family_couples_edges, nodes = nodes, node_key="name", directed =  FALSE)
+
+family_couples_coords = layout_with_fr(family_couples_graph)
+family_couples_graph %>% 
+  activate(nodes) %>%
+  mutate(pagerank = centrality_pagerank()) %>%
+  mutate(membership = membership(families)[name]) %>%
+  activate(edges) %>%
+  mutate(betweenness = centrality_edge_betweenness()) %>%
+  ggraph(layout = family_couples_coords) +
+  geom_edge_arc(aes(alpha = betweenness, colour = as.factor(couple)), 
+                    show.legend = F, strength = 0.05) +
+  geom_node_point(aes(size = pagerank, colour = as.factor(membership)), 
+                  show.legend = F) +
+  geom_node_text(aes(label = name), repel = T)
+```
+
+## Power in the Couples-Families network
+
+In the previous visualization we focused on the aspect of centrality of nodes. We now focus on power.
+```{r, include = F,warning = F, message = F}
+
+regularify(family_couples_graph)
+A = as_adjacency_matrix(family_couples_graph)
+I = diag(0.15, vcount(family_couples_graph))
+(AI = A + I)
+
+```
+
+```{r, include = T,warning = F, message = F}
+power = power(AI, 6)[1]
+
+family_couples_graph %>%
+  activate(nodes) %>%
+  right_join(tibble(1:59, as_tibble(power)) %>% rename(id = `1:59`, power = vector)) %>%
+  mutate(membership = membership(families)[name]) %>%
+  activate(edges) %>%
+  mutate(betweenness = centrality_edge_betweenness()) %>%
+  ggraph(layout = family_couples_coords) +
+  geom_edge_arc(aes(alpha = betweenness, colour = as.factor(couple)), strength = 0.05) +
+  geom_node_point(aes(size = power, colour = as.factor(membership))) +
+  geom_node_text(aes(label = name), repel = T)
+
+```
+
+## Centrality and Power
+
+We now compare the two measures and how they relate with each other. 
+```{r, include = T,warning = F, message = F}
+
+pagerank_power_family_couple =
+family_couples_graph %>%
+  activate(nodes) %>%
+  mutate(pagerank = centrality_pagerank()) %>%
+  right_join(tibble(1:59, as_tibble(power)) %>% rename(id = `1:59`, power = vector)) %>%
+  as_tibble(what="nodes")
+
+mc = quantile(pagerank_power_family_couple$pagerank, 0.75)
+mp = quantile(pagerank_power_family_couple$power, 0.75)
+# Basic scatter plot
+pagerank_power_family_couple %>%
+ggplot(aes(x=power, y=pagerank)) +
+  geom_point() +
+  geom_text(aes(label=name)) +
+  geom_hline(aes(yintercept = mc)) + 
+  geom_vline(aes(xintercept = mp)) +
+  theme_bw()
+```
+
+## Centrality and Power
+
+From the scatterplot we could evince which penguins were more powerful and more important. In
+particular, we noticed some correlation between the two measures which is confirmed by the following correlation plot.
+```{r, include = F,warning = F, message = F}
+M = cbind(pagerank = pagerank_power_family_couple$pagerank,
+          power = pagerank_power_family_couple$power)
+
+(corM = cor(M))
+```
+```{r, include = T,warning = F, message = F}
+corrplot(corM, method = "ellipse")
+```
+
+## Some Trivia
+
+**Hachi**: "Dominates her boyfriend".
+
+**Muro**: "Invaded another penguins' house thinking it was her own".
+
+**Nishi**: "Overly doting father".
+
+**Shinmachi**: "Media friendly and likes people more than penguins".
+
+## Number of babies and power
+As previously mentioned, our interpretation of power is closely related to 
+the number of baby penguins of an exemplar. This is further emphasized by the following correlation plot.
+```{r, include = F,warning = F, message = F}
+in_degree_family <- 
+  as.data.frame(degree(family_directed_graph, mode = 'in'))
+
+in_degree_family <- 
+  as_tibble(rownames_to_column(in_degree_family, 'name')) %>%
+  rename(in_degree = `degree(family_directed_graph, mode = "in")`) %>%
+  arrange(name)
+
+child_power_corrleation = cbind(power = pagerank_power_family_couple$power,
+                                children = in_degree_family$in_degree)
+
+(corChild_Power = cor(child_power_corrleation))
+```
+
+```{r, include = T,warning = F, message = F}
+corrplot(corChild_Power, method = "ellipse")
+```
+
+## Communities
+
+Let us now turn our attention on community detection. We expect to find that communities are dictated mostly by the family relation. 
+
+First of all, we notice that the exemplars without a family are included in the families of their partner. This is reasonable from a social perspective.
+Moreover, we see that couples mostly fall in the same communities with just few exceptions. An example is the couple made by **Man** and **Matsu**.
+
+As a second observation, we could take in consideration the found communities for splitting the penguins into different environments if strictly needed.
+
+## Communities
+```{r, include = T,warning = F, message = F}
+communities = cluster_optimal(family_couples_graph)
+length(communities)
+modularity(communities)
+### Communities detected 
+family_couples_graph %>% 
+  activate(nodes) %>%
+  mutate(pagerank = centrality_pagerank()) %>%
+  mutate(community = membership(communities)[name]) %>%
+  activate(edges) %>%
+  mutate(betweenness = centrality_edge_betweenness()) %>%
+  ggraph(layout = family_couples_coords) +
+  geom_edge_arc(aes(alpha = betweenness, colour = as.factor(couple)), strength = 0.05) +
+  geom_node_point(aes(size = pagerank, colour = as.factor(community))) +
+  geom_node_text(aes(label = name), repel = T)  +
+  scale_color_brewer(palette = "Paired")
+
+```
+
+## Connectivity and Resilience
+
+Before going on we precise that from now on we consider the graph induced by the three relations between nodes: couple, exes, family. We motivate such decision with the assumption that one of the three is sufficient to suppose some kind of daily social activity.
+
+## Connectivity and Resilience
+```{r, include = T,warning = F, message = F}
+family_couples_exes_graph <- tbl_graph(edges =
+                                         family_couples_exes_edges,
+                                       nodes = nodes,
+                                       directed = F)
+
+fce_coords = layout_with_fr(family_couples_exes_graph)
+
+family_couples_exes_graph %>% 
+  activate(nodes) %>%
+  mutate(pagerank = centrality_pagerank()) %>%
+  activate(edges) %>%
+  mutate(betweenness = centrality_edge_betweenness()) %>%
+  ggraph(layout = family_couples_exes_coords) +
+  geom_edge_arc(aes(alpha = betweenness), strength = 0.05) +
+  geom_node_point(aes(size = pagerank, colour = pagerank)) +
+  geom_node_text(aes(label = name), repel = T)  +
+  scale_color_continuous()
+```
+
+## K-connected components
+We notice that there is 1 connected component which cover basically the entire component. In addition there is a biconnected component that spans over 47 out of 59 penguins.
+```{r, include = T,warning = F, message = F}
+b = cohesive_blocks(family_couples_exes_graph)
+b
+```
+
+## Percolation
+
+In this particular case we could use percolation as a vaccination strategy for the penguins. Here we consider
+```{r, include = T,warning = F, message = F}
+# resilience
+size = vcount(family_couples_exes_graph) -
+  vcount(family_couples_exes_graph)/8
+# random
+rand =
+  percolate(family_couples_exes_graph, size, d =
+              sample(V(family_couples_exes_graph), size))   
+
+# hub
+hub = percolate(family_couples_exes_graph, size, d =
+                  hub_score(family_couples_exes_graph)$vector)    
+# pagerank
+pr = percolate(family_couples_exes_graph, size, d=
+                 page_rank(family_couples_exes_graph)$vector)    
+# betweenness
+bet = percolate(family_couples_exes_graph, size, d =
+                  betweenness(family_couples_exes_graph))    
+
+theme_set(theme_bw())
+plot(0:size, hub, type = "l", col=1, 
+     xlab="Number of removed nodes", 
+     ylab="Size of giant component")
+lines(0:size, pr, col=2)
+lines(0:size, bet, col=3)
+lines(0:size, rand, col=4)
+lines(0:size, rep(vcount(family_couples_exes_graph)/1.5, size+1), lty=2)
+legend(x = "bottomleft", 
+       legend = c("hub", "pr", "btw", "rand"), lty = 1, col = 1:4)
+
+```
